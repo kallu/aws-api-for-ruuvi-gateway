@@ -7,3 +7,8 @@ Bill-of-materials for a simple proxy to forward HTTP POSTs to Ruuvi API
 * [AWS Certificate Manager](https://aws.amazon.com/certificate-manager/) (optional)
 
 ![High level architecture diagram of AWS API for Ruuvi Gateway](img/SimpleProxy.png)
+
+Misc resources
+
+* https://jsonplaceholder.typicode.com/
+* https://cjohansen.no/aws-apigw-proxy-cloudformation/

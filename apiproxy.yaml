@@ -1,0 +1,129 @@
+# Modified from original template by https://cjohansen.no/aws-apigw-proxy-cloudformation/
+# LICENSE https://creativecommons.org/licenses/by-nc-sa/3.0/
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: API to proxy requests for another HTTP(S) REST API
+
+Parameters:
+
+  CustomDomain:
+    Type: String
+    Description: Route53 zone to register API name (without trailing dot)
+    Default: carriagereturn.nl
+
+  CustomCertARN:
+    Type: String
+    Description: ACM managed SSL certifcate for API name
+    Default: arn:aws:acm:eu-west-1:430997289407:certificate/21658128-5712-415b-a7c9-3808fc95f3c9
+
+  APIURI:
+    Type: String
+    Description: Original API to be proxied (without trailing slash)
+    Default: http://jsonplaceholder.typicode.com
+
+  ProxyStageName:
+    Type: String
+    Description: Proxy API stage name
+    Default: default
+
+Resources:
+
+  Api:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Ref AWS::StackName
+      Description: !Sub "Proxy API for ${APIURI}"
+      DisableExecuteApiEndpoint: False
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  APIDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Sub "${AWS::StackName}.${CustomDomain}"
+      RegionalCertificateArn: !Ref CustomCertARN
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  Mapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn:
+      - APIDomain
+      - Deployment
+    Properties:
+      # BasePath: ""
+      DomainName: !Sub "${AWS::StackName}.${CustomDomain}"
+      RestApiId: !Ref Api
+      Stage: !Ref ProxyStageName
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Type: A
+      Name: !Sub "${AWS::StackName}.${CustomDomain}"
+      HostedZoneName: !Sub "${CustomDomain}."
+      AliasTarget:
+        HostedZoneId: !GetAtt APIDomain.RegionalHostedZoneId
+        DNSName: !GetAtt APIDomain.RegionalDomainName
+      Comment: !Sub "Part of Cloudformation stack ${AWS::StackName}"
+
+  Resource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt Api.RootResourceId
+      RestApiId: !Ref Api
+      PathPart: '{proxy+}'
+
+  RootMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: ANY
+      ResourceId: !GetAtt Api.RootResourceId
+      RestApiId: !Ref Api
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: ANY
+        Type: HTTP_PROXY
+        Uri: !Ref APIURI
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+
+  ProxyMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: ANY
+      ResourceId: !Ref Resource
+      RestApiId: !Ref Api
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        CacheKeyParameters:
+          - 'method.request.path.proxy'
+        RequestParameters:
+          integration.request.path.proxy: 'method.request.path.proxy'
+        IntegrationHttpMethod: ANY
+        Type: HTTP_PROXY
+        Uri: !Join [ '/', [ !Ref APIURI, '{proxy}' ] ]
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+
+  Deployment:
+    DependsOn:
+      - RootMethod
+      - ProxyMethod
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref Api
+      StageName: !Ref ProxyStageName
+
+Outputs:
+
+  ProxyURI:
+    Description: URI for proxy API
+    Value: !Sub "https://${AWS::StackName}.${CustomDomain}/"
+
