@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: DynamoDB tables for Ruuvi API sensor data and configuration management
+
+Parameters:
+  
+  DataRetentionDays:
+    Type: Number
+    Description: Number of days to retain sensor data (TTL)
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
+  Environment:
+    Type: String
+    Description: Environment name for resource naming
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+Resources:
+
+  # Primary table for storing sensor data from Ruuvi Gateways
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-sensor-data-${Environment}"
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: gateway_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gateway-timestamp-index
+          KeySchema:
+            - AttributeName: gateway_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: RuuviAPI
+        - Key: Purpose
+          Value: SensorDataStorage
+
+  # Configuration table for dynamic settings
+  ConfigurationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-config-${Environment}"
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: config_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: RuuviAPI
+        - Key: Purpose
+          Value: ConfigurationStorage
+
+  # IAM role for Lambda functions to access DynamoDB tables
+  DynamoDBAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-dynamodb-access-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt SensorDataTable.Arn
+                  - !Sub "${SensorDataTable.Arn}/index/*"
+                  - !GetAtt ConfigurationTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+Outputs:
+
+  SensorDataTableName:
+    Description: Name of the sensor data DynamoDB table
+    Value: !Ref SensorDataTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SensorDataTable-${Environment}"
+
+  SensorDataTableArn:
+    Description: ARN of the sensor data DynamoDB table
+    Value: !GetAtt SensorDataTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-SensorDataTableArn-${Environment}"
+
+  ConfigurationTableName:
+    Description: Name of the configuration DynamoDB table
+    Value: !Ref ConfigurationTable
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigurationTable-${Environment}"
+
+  ConfigurationTableArn:
+    Description: ARN of the configuration DynamoDB table
+    Value: !GetAtt ConfigurationTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigurationTableArn-${Environment}"
+
+  DynamoDBAccessRoleArn:
+    Description: ARN of the IAM role for DynamoDB access
+    Value: !GetAtt DynamoDBAccessRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DynamoDBAccessRole-${Environment}"
+
+  GatewayTimestampIndexName:
+    Description: Name of the Gateway-Timestamp GSI
+    Value: gateway-timestamp-index
+    Export:
+      Name: !Sub "${AWS::StackName}-GatewayTimestampIndex-${Environment}"

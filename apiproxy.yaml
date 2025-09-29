@@ -4,6 +4,9 @@
 AWSTemplateFormatVersion: 2010-09-09
 Description: API to proxy requests for another HTTP(S) REST API
 
+Conditions:
+  CreateCognitoAuth: !Equals [!Ref EnableCognitoAuth, "true"]
+
 Parameters:
 
   CustomDomain:
@@ -16,23 +19,349 @@ Parameters:
     Description: ACM managed SSL certifcate for API name
     Default: arn:aws:acm:eu-west-1:430997289407:certificate/21658128-5712-415b-a7c9-3808fc95f3c9
 
-  APIURI:
+  RuuviCloudAPIEndpoint:
     Type: String
-    Description: Original API to be proxied (without trailing slash)
-    Default: http://jsonplaceholder.typicode.com
+    Description: Ruuvi Cloud Gateway API endpoint (without trailing slash)
+    Default: https://network.ruuvi.com/api/v1
 
   ProxyStageName:
     Type: String
     Description: Proxy API stage name
     Default: default
 
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda function code
+    Default: ""
+
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key for Lambda function code zip file
+    Default: lambda-functions.zip
+
+  EnableCognitoAuth:
+    Type: String
+    Description: Enable Cognito User Pool authentication for web clients
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  CognitoUserPoolName:
+    Type: String
+    Description: Name for Cognito User Pool (only used if EnableCognitoAuth is true)
+    Default: "ruuvi-api-users"
+
+  DataRetentionDays:
+    Type: Number
+    Description: Number of days to retain sensor data (TTL)
+    Default: 90
+    MinValue: 1
+    MaxValue: 3650
+
 Resources:
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt SensorDataTable.Arn
+                  - !GetAtt ConfigTable.Arn
+                  - !Sub "${SensorDataTable.Arn}/index/*"
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: "RuuviAPI"
+
+  # CloudWatch Log Groups
+  ProxyFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-proxy"
+      RetentionInDays: 14
+
+  RetrieveFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-retrieve"
+      RetentionInDays: 14
+
+  ConfigFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-config"
+      RetentionInDays: 14
+
+  # Lambda Functions
+  ProxyFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ProxyFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-proxy"
+      Runtime: python3.11
+      Handler: proxy.index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          RUUVI_CLOUD_ENDPOINT: !Ref RuuviCloudAPIEndpoint
+          SENSOR_DATA_TABLE: !Ref SensorDataTable
+          CONFIG_TABLE: !Ref ConfigTable
+          DATA_RETENTION_DAYS: !Ref DataRetentionDays
+      Timeout: 30
+      MemorySize: 512
+
+  RetrieveFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RetrieveFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-retrieve"
+      Runtime: python3.11
+      Handler: retrieve.index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          SENSOR_DATA_TABLE: !Ref SensorDataTable
+          DATA_RETENTION_DAYS: !Ref DataRetentionDays
+      Timeout: 30
+      MemorySize: 512
+
+  ConfigFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ConfigFunctionLogGroup
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-config"
+      Runtime: python3.11
+      Handler: config.index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      Environment:
+        Variables:
+          CONFIG_TABLE: !Ref ConfigTable
+      Timeout: 15
+      MemorySize: 256
+
+  # DynamoDB Tables
+  SensorDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-sensor-data"
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: device_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: gateway_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: gateway-timestamp-index
+          KeySchema:
+            - AttributeName: gateway_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: RuuviAPI
+        - Key: Purpose
+          Value: SensorDataStorage
+
+  ConfigTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-config"
+      BillingMode: ON_DEMAND
+      AttributeDefinitions:
+        - AttributeName: config_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: config_key
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: RuuviAPI
+        - Key: Purpose
+          Value: ConfigurationStorage
+
+  # Lambda Permissions for API Gateway
+  ProxyFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProxyFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${Api}/*/*"
+
+  RetrieveFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RetrieveFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${Api}/*/*"
+
+  ConfigFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${Api}/*/*"
+
+  # API Key Authentication
+  GatewayApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-gateway-key"
+      Description: "API Key for Ruuvi Gateway devices"
+      Enabled: true
+
+  AdminApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub "${AWS::StackName}-admin-key"
+      Description: "Admin API Key for configuration management"
+      Enabled: true
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-usage-plan"
+      Description: "Usage plan for Ruuvi API"
+      Throttle:
+        RateLimit: 1000
+        BurstLimit: 2000
+      Quota:
+        Limit: 100000
+        Period: MONTH
+      ApiStages:
+        - ApiId: !Ref Api
+          Stage: !Ref ProxyStageName
+
+  GatewayUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref GatewayApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  AdminUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref AdminApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # Optional Cognito User Pool for Web Clients
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Condition: CreateCognitoAuth
+    Properties:
+      UserPoolName: !Ref CognitoUserPoolName
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: CreateCognitoAuth
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub "${AWS::StackName}-web-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      RefreshTokenValidity: 30
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: CreateCognitoAuth
+    Properties:
+      Name: !Sub "${AWS::StackName}-cognito-authorizer"
+      RestApiId: !Ref Api
+      Type: COGNITO_USER_POOLS
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+      IdentitySource: method.request.header.Authorization
 
   Api:
     Type: 'AWS::ApiGateway::RestApi'
     Properties:
       Name: !Ref AWS::StackName
-      Description: !Sub "Proxy API for ${APIURI}"
+      Description: !Sub "Ruuvi API Proxy for ${RuuviCloudAPIEndpoint}"
       DisableExecuteApiEndpoint: False
       EndpointConfiguration:
         Types:
@@ -76,54 +405,495 @@ Resources:
       RestApiId: !Ref Api
       PathPart: '{proxy+}'
 
-  RootMethod:
-    Type: 'AWS::ApiGateway::Method'
+  # Ruuvi Cloud Proxy Method (POST /api/v1/data)
+  ApiResource:
+    Type: 'AWS::ApiGateway::Resource'
     Properties:
-      HttpMethod: ANY
-      ResourceId: !GetAtt Api.RootResourceId
+      ParentId: !GetAtt Api.RootResourceId
       RestApiId: !Ref Api
-      AuthorizationType: NONE
-      Integration:
-        IntegrationHttpMethod: ANY
-        Type: HTTP_PROXY
-        Uri: !Ref APIURI
-        PassthroughBehavior: WHEN_NO_MATCH
-        IntegrationResponses:
-          - StatusCode: 200
+      PathPart: 'api'
+
+  V1Resource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref ApiResource
+      RestApiId: !Ref Api
+      PathPart: 'v1'
+
+  DataResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref V1Resource
+      RestApiId: !Ref Api
+      PathPart: 'data'
 
   ProxyMethod:
     Type: 'AWS::ApiGateway::Method'
     Properties:
-      HttpMethod: ANY
-      ResourceId: !Ref Resource
+      HttpMethod: POST
+      ResourceId: !Ref DataResource
       RestApiId: !Ref Api
-      AuthorizationType: NONE
-      RequestParameters:
-        method.request.path.proxy: true
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
       Integration:
-        CacheKeyParameters:
-          - 'method.request.path.proxy'
-        RequestParameters:
-          integration.request.path.proxy: 'method.request.path.proxy'
-        IntegrationHttpMethod: ANY
-        Type: HTTP_PROXY
-        Uri: !Join [ '/', [ !Ref APIURI, '{proxy}' ] ]
-        PassthroughBehavior: WHEN_NO_MATCH
-        IntegrationResponses:
-          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProxyFunction.Arn}/invocations"
+
+  # Local Data Access Endpoints
+  LocalResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref V1Resource
+      RestApiId: !Ref Api
+      PathPart: 'local'
+
+  LocalDataResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref LocalResource
+      RestApiId: !Ref Api
+      PathPart: 'data'
+
+  # Current data endpoint: GET /api/v1/local/data/current/{device_id}
+  CurrentResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref LocalDataResource
+      RestApiId: !Ref Api
+      PathPart: 'current'
+
+  CurrentDeviceResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref CurrentResource
+      RestApiId: !Ref Api
+      PathPart: '{device_id}'
+
+  CurrentDataMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref CurrentDeviceResource
+      RestApiId: !Ref Api
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.device_id: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RetrieveFunction.Arn}/invocations"
+
+  # Historical data endpoint: GET /api/v1/local/data/history/{device_id}
+  HistoryResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref LocalDataResource
+      RestApiId: !Ref Api
+      PathPart: 'history'
+
+  HistoryDeviceResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref HistoryResource
+      RestApiId: !Ref Api
+      PathPart: '{device_id}'
+
+  HistoryDataMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref HistoryDeviceResource
+      RestApiId: !Ref Api
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.path.device_id: true
+        method.request.querystring.start_time: false
+        method.request.querystring.end_time: false
+        method.request.querystring.limit: false
+        method.request.querystring.next_token: false
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RetrieveFunction.Arn}/invocations"
+
+  # Device listing endpoint: GET /api/v1/local/devices
+  DevicesResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref LocalResource
+      RestApiId: !Ref Api
+      PathPart: 'devices'
+
+  DevicesMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref DevicesResource
+      RestApiId: !Ref Api
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RetrieveFunction.Arn}/invocations"
+
+  # Configuration Management Endpoints
+  ConfigResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref V1Resource
+      RestApiId: !Ref Api
+      PathPart: 'config'
+
+  ForwardingConfigResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !Ref ConfigResource
+      RestApiId: !Ref Api
+      PathPart: 'forwarding'
+
+  # PUT /api/v1/config/forwarding
+  ConfigUpdateMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: PUT
+      ResourceId: !Ref ForwardingConfigResource
+      RestApiId: !Ref Api
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConfigFunction.Arn}/invocations"
+
+  # GET /api/v1/config/forwarding
+  ConfigGetMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: GET
+      ResourceId: !Ref ForwardingConfigResource
+      RestApiId: !Ref Api
+      AuthorizationType: API_KEY
+      ApiKeyRequired: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConfigFunction.Arn}/invocations"
 
   Deployment:
     DependsOn:
-      - RootMethod
       - ProxyMethod
+      - CurrentDataMethod
+      - HistoryDataMethod
+      - DevicesMethod
+      - ConfigUpdateMethod
+      - ConfigGetMethod
     Type: 'AWS::ApiGateway::Deployment'
     Properties:
       RestApiId: !Ref Api
       StageName: !Ref ProxyStageName
+
+  # CloudWatch Dashboard for monitoring
+  RuuviAPIDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProxyFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Proxy Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${RetrieveFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Retrieve Function Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${Api}" ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "RuuviAPI", "ForwardingSuccess", "Environment", "${AWS::StackName}" ],
+                  [ ".", "ForwardingFailure", ".", "." ],
+                  [ ".", "LocalStorageSuccess", ".", "." ],
+                  [ ".", "LocalStorageFailure", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Custom Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${SensorDataTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ],
+                  [ ".", "ConsumedReadCapacityUnits", "TableName", "${ConfigTable}" ],
+                  [ ".", "ConsumedWriteCapacityUnits", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms
+  ProxyFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-proxy-function-errors"
+      AlarmDescription: "High error rate in proxy function"
+      MetricName: ErrorRate
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProxyFunction
+      TreatMissingData: notBreaching
+
+  ProxyFunctionDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-proxy-function-duration"
+      AlarmDescription: "High duration in proxy function"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProxyFunction
+      TreatMissingData: notBreaching
+
+  APIGateway4XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-4xx-errors"
+      AlarmDescription: "High 4XX error rate in API Gateway"
+      MetricName: 4XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref Api
+      TreatMissingData: notBreaching
+
+  APIGateway5XXErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-5xx-errors"
+      AlarmDescription: "High 5XX error rate in API Gateway"
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref Api
+      TreatMissingData: notBreaching
+
+  RuuviCloudFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ruuvi-cloud-failures"
+      AlarmDescription: "High failure rate when forwarding to Ruuvi Cloud"
+      MetricName: ForwardingFailure
+      Namespace: RuuviAPI
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Environment
+          Value: !Ref AWS::StackName
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-dynamodb-throttles"
+      AlarmDescription: "DynamoDB throttling events detected"
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SensorDataTable
+      TreatMissingData: notBreaching
 
 Outputs:
 
   ProxyURI:
     Description: URI for proxy API
     Value: !Sub "https://${AWS::StackName}.${CustomDomain}/"
+
+  GatewayApiKeyId:
+    Description: API Key ID for Ruuvi Gateway devices
+    Value: !Ref GatewayApiKey
+    Export:
+      Name: !Sub "${AWS::StackName}-gateway-api-key-id"
+
+  AdminApiKeyId:
+    Description: Admin API Key ID for configuration management
+    Value: !Ref AdminApiKey
+    Export:
+      Name: !Sub "${AWS::StackName}-admin-api-key-id"
+
+  CognitoUserPoolId:
+    Condition: CreateCognitoAuth
+    Description: Cognito User Pool ID for web client authentication
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-cognito-user-pool-id"
+
+  CognitoUserPoolClientId:
+    Condition: CreateCognitoAuth
+    Description: Cognito User Pool Client ID for web applications
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-cognito-client-id"
+
+  SensorDataTableName:
+    Description: DynamoDB table name for sensor data
+    Value: !Ref SensorDataTable
+    Export:
+      Name: !Sub "${AWS::StackName}-sensor-data-table"
+
+  ConfigTableName:
+    Description: DynamoDB table name for configuration
+    Value: !Ref ConfigTable
+    Export:
+      Name: !Sub "${AWS::StackName}-config-table"
+
+  ProxyFunctionName:
+    Description: Name of the proxy Lambda function
+    Value: !Ref ProxyFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-proxy-function"
+
+  RetrieveFunctionName:
+    Description: Name of the retrieve Lambda function
+    Value: !Ref RetrieveFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-retrieve-function"
+
+  ConfigFunctionName:
+    Description: Name of the config Lambda function
+    Value: !Ref ConfigFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-config-function"
+
+  DataRetentionDays:
+    Description: Configured data retention period in days
+    Value: !Ref DataRetentionDays
+    Export:
+      Name: !Sub "${AWS::StackName}-data-retention-days"
+
+  DashboardURL:
+    Description: URL to the CloudWatch dashboard
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-dashboard"
+
+  ProxyFunctionLogGroup:
+    Description: CloudWatch log group for proxy function
+    Value: !Ref ProxyFunctionLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-proxy-log-group"
+
+  RetrieveFunctionLogGroup:
+    Description: CloudWatch log group for retrieve function
+    Value: !Ref RetrieveFunctionLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-retrieve-log-group"
+
+  ConfigFunctionLogGroup:
+    Description: CloudWatch log group for config function
+    Value: !Ref ConfigFunctionLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-config-log-group"
 

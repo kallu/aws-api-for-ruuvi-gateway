@@ -1,0 +1,11 @@
+{
+  "CustomDomain": "carriagereturn.nl",
+  "CustomCertARN": "arn:aws:acm:eu-west-1:430997289407:certificate/21658128-5712-415b-a7c9-3808fc95f3c9",
+  "RuuviCloudAPIEndpoint": "https://network.ruuvi.com/api/v1",
+  "ProxyStageName": "staging",
+  "EnableCognitoAuth": "true",
+  "CognitoUserPoolName": "ruuvi-api-users-staging",
+  "DataRetentionDays": 60,
+  "LambdaCodeBucket": "ruuvi-api-lambda-staging-eu-west-1",
+  "LambdaCodeKey": "lambda-functions.zip"
+}

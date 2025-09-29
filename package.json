@@ -1,0 +1,36 @@
+{
+  "name": "ruuvi-api-proxy",
+  "version": "1.0.0",
+  "description": "Serverless API proxy for Ruuvi Gateway devices with local data storage",
+  "main": "index.js",
+  "scripts": {
+    "test": "pytest tests/ -v",
+    "test:unit": "pytest tests/unit/ -v",
+    "test:integration": "pytest tests/integration/ -v",
+    "lint": "flake8 src/ tests/",
+    "format": "black src/ tests/",
+    "build": "python scripts/build.py",
+    "deploy": "aws cloudformation deploy --template-file enhanced-apiproxy.yaml --stack-name ruuvi-api-proxy --capabilities CAPABILITY_IAM",
+    "package": "python scripts/package_lambdas.py"
+  },
+  "keywords": [
+    "ruuvi",
+    "aws",
+    "lambda",
+    "api-gateway",
+    "dynamodb",
+    "serverless"
+  ],
+  "author": "Ruuvi API Team",
+  "license": "MIT",
+  "devDependencies": {
+    "aws-cli": "^1.32.0"
+  },
+  "engines": {
+    "python": ">=3.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "."
+  }
+}
